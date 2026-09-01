@@ -687,6 +687,9 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         // hands the row to the Phase-3 repair. The hint only affects speed.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
+            // tid 0 rewrites val_lo/val_hi below; the block must finish
+            // reading them first, or a straggler skips the barrier below.
+            __syncthreads();
             if (tid == 0)
             {
                 float const seed = (smem->val_hi <= -FLT_MAX) ? 0.0f : smem->pmax_saved;
@@ -728,6 +731,9 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         {
             if (smem->done)
                 break;
+            // `done` is read at the loop head above and rewritten by tid 0
+            // below; the read must complete first or a straggler breaks out.
+            __syncthreads();
             if (tid == 0)
             {
                 float vlo = smem->val_lo, vhi = smem->val_hi;
@@ -1022,6 +1028,8 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         if (block_max <= block_min)
             block_max = block_min + 1e-6f;
 
+        // histogram[0..NUM_WARPS) still holds the per-warp maxima read above.
+        __syncthreads();
         for (int i = tid; i < kBins; i += BLOCK_SIZE)
             smem->histogram[i] = 0;
         __syncthreads();
@@ -1342,6 +1350,9 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         // hands the row to the Phase-3 repair. The hint only affects speed.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
+            // tid 0 rewrites val_lo/val_hi below; the block must finish
+            // reading them first, or a straggler skips the barrier below.
+            __syncthreads();
             if (tid == 0)
             {
                 float const seed = (smem->val_hi <= -FLT_MAX) ? 0.0f : smem->pmax_saved;
@@ -1383,6 +1394,9 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         {
             if (smem->done)
                 break;
+            // `done` is read at the loop head above and rewritten by tid 0
+            // below; the read must complete first or a straggler breaks out.
+            __syncthreads();
             if (tid == 0)
             {
                 float vlo = smem->val_lo, vhi = smem->val_hi;
@@ -1676,6 +1690,8 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         if (block_max <= block_min)
             block_max = block_min + 1e-6f;
 
+        // histogram[0..NUM_WARPS) still holds the per-warp maxima read above.
+        __syncthreads();
         for (int i = tid; i < kBins; i += BLOCK_SIZE)
             smem->histogram[i] = 0;
         __syncthreads();

@@ -2425,6 +2425,68 @@ def test_indexer_topk_decode_gvr_hostile_hint(index_topk, num_tokens, dtype, hin
     _gvr_decode_exact_check(logits, pre, index_topk, f"hint={hint}")
 
 
+def _gvr_decode_exact_check_rows(logits, pre_idx, index_topk, launches, tag):
+    """Same tie-aware exact check as above, over a batch of rows (cr=4)."""
+    num_rows, n = logits.shape
+    seq_lens = torch.full((num_rows,), n * 4, dtype=torch.int32, device="cuda")
+    scratch = torch.full((num_rows * index_topk,), float("nan"), dtype=logits.dtype, device="cuda")
+    aux_indices, aux_logits = _build_radix_aux_buffers(num_rows, index_topk)
+    flat = logits.float()
+    ref = flat.topk(index_topk, dim=-1).values.sort(dim=-1).values
+    for launch in range(launches):
+        indices = torch.full((num_rows, index_topk), -1, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.indexer_topk_decode(
+            logits,
+            seq_lens,
+            indices,
+            1,
+            index_topk,
+            pre_idx,
+            scratch,
+            compress_ratio=4,
+            radix_aux_indices=aux_indices,
+            radix_aux_logits=aux_logits,
+        )
+        torch.cuda.synchronize()
+        where = f"{tag} launch={launch}"
+        # `scratch` is written only by the GVR kernel. If the dispatcher sent
+        # this row count to Radix instead -- kBsLarge scales with the SM count
+        # -- the sentinel survives and the checks below prove nothing.
+        assert not bool(scratch.isnan().all()), f"{where}: did not route to GVR"
+        n_unwritten = int((indices < 0).sum())
+        assert n_unwritten == 0, f"{where}: {n_unwritten} output slots are -1"
+        n_oob = int((indices >= n).sum())
+        assert n_oob == 0, f"{where}: {n_oob} output indices are out of range"
+        ordered = indices.sort(dim=-1).values
+        n_dup = int((ordered[:, 1:] == ordered[:, :-1]).sum())
+        assert n_dup == 0, f"{where}: {n_dup} duplicate output indices"
+        got = flat.gather(1, indices.long()).sort(dim=-1).values
+        assert torch.equal(got, ref), f"{where}: selected values differ from torch.topk"
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"]
+)
+def test_indexer_topk_decode_gvr_cold_start_many_rows(dtype):
+    """All-zero ``pre_idx`` -- the state before the first decode step -- with
+    enough rows in flight to keep several CTAs resident.
+
+    Every gathered hint value is then ``logits[row][0]``, which collapses
+    Phase 1's bracket the same way ``uniform_max`` above does. The hostile-hint
+    cases run one row at a time, and this kernel is one CTA per row, so
+    block-scoped ordering in Phase 1 only reproduces reliably with several
+    CTAs resident. Repeated launches because the failure is a race, not a
+    deterministic miscompare.
+    """
+    torch.manual_seed(1234)
+    num_rows, num_tokens = 256, 16384
+    logits = torch.randn((num_rows, num_tokens), dtype=torch.float32, device="cuda").to(dtype)
+    for index_topk in (512, 1024, 2048):
+        pre = torch.zeros((num_rows, index_topk), dtype=torch.int32, device="cuda")
+        _gvr_decode_exact_check_rows(logits, pre, index_topk, 20, f"index_topk={index_topk}")
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("n_tie", [6000, 20000, 100000])
